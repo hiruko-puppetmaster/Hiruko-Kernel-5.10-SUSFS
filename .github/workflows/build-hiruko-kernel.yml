@@ -37,15 +37,24 @@ jobs:
             python3-pip rsync unzip wget zip
 
       - name: Download AOSP Clang Toolchain (clang-r416183b)
-        # Required by android12-5.10 build.config.common:
-        # https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10/build.config.common
-        # Prebuilts repository:
-        # https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/
+        # clang-r416183b lives on the master-kernel-build-2021 branch of AOSP prebuilts:
+        # https://github.com/carlodandan/Action-Kernel-Builder/blob/main/build
+        # https://github.com/mohdakil2426/marble-kernel-builder/blob/main/docs/versions.md
         run: |
           mkdir -p "$HOME/toolchains/clang"
-          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r416183b.tar.gz" -O clang.tar.gz
-          tar -xzf clang.tar.gz -C "$HOME/toolchains/clang"
-          rm clang.tar.gz
+          if wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz" -O clang.tar.gz; then
+            tar -xzf clang.tar.gz -C "$HOME/toolchains/clang"
+            rm -f clang.tar.gz
+          else
+            git clone --depth=1 --filter=blob:none --sparse -b master-kernel-build-2021 \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-repo
+            cd clang-repo
+            git sparse-checkout set clang-r416183b
+            cp -r clang-r416183b/* "$HOME/toolchains/clang/"
+            cd ..
+            rm -rf clang-repo
+          fi
+          "$HOME/toolchains/clang/bin/clang" --version
 
       - name: Clone Android12-5.10-LTS Kernel Source
         # Reference: https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10-lts
@@ -54,28 +63,28 @@ jobs:
           cd kernel
           head -n 4 Makefile
 
-      - name: Integrate KernelSU-Next (next-susfs) & SUSFS
-        # Pre-integrated KernelSU-Next SUSFS guide:
-        # https://droidbasement.com/db-blog/tutorial-kernelsu-next-with-susfs-integrated-in-to-a-gki-generic-kernel-image/
+      - name: Integrate KernelSU-Next (SUSFS) & SUSFS Patches
+        # Pre-integrated KernelSU-Next SUSFS branch (pershoot/KernelSU-Next#dev-susfs):
+        # https://github.com/WildKernels/GKI_KernelSU_SUSFS/releases
+        # https://github.com/KernelSU-Next/KernelSU-Next/issues/1293
         # SUSFS repository: https://gitlab.com/simonpunk/susfs4ksu/-/tags
         run: |
-          # 1. Setup KernelSU-Next using the pre-integrated next-susfs branch inside kernel/
+          # 1. Setup KernelSU-Next with pre-integrated SUSFS inside kernel/
           cd kernel
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
           cd ..
 
           # 2. Clone SUSFS for GKI Android12-5.10
           git clone --depth=1 -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
 
           # 3. Copy SUSFS kernel source files and kernel-side patch into kernel tree
-          # (10_enable_susfs_for_ksu.patch is skipped because next-susfs already includes SUSFS support)
           cp susfs4ksu/kernel_patches/fs/* kernel/fs/
           cp susfs4ksu/kernel_patches/include/linux/* kernel/include/linux/
           cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch kernel/
 
-          # 4. Apply kernel-side SUSFS patch (fail fast if any hunk is rejected)
+          # 4. Apply kernel-side SUSFS patch (allow fuzz=3 for minor LTS line-offset shifts)
           cd kernel
-          patch -p1 --forward < 50_add_susfs_in_gki-android12-5.10.patch
+          patch -p1 --forward --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
 
       - name: Configure Kernel, Localversion & SUSFS
         working-directory: kernel
@@ -91,13 +100,10 @@ jobs:
           # Reference: https://github.com/xerootg/linux-duoqin-f25pro
           ./scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS
 
-          # Enable KernelSU-Next with kprobe hooks
+          # Enable KernelSU-Next & SUSFS (manual hooks are provided by 50_add_susfs patch)
+          # Reference: https://github.com/KernelSU-Next/KernelSU-Next/issues/1293
           ./scripts/config --enable CONFIG_KSU
-          ./scripts/config --enable CONFIG_KPROBES
-          ./scripts/config --enable CONFIG_HAVE_KPROBES
-          ./scripts/config --enable CONFIG_KPROBE_EVENTS
-
-          # Enable SUSFS Root-Hiding Features
+          ./scripts/config --disable CONFIG_KSU_KPROBES_HOOK
           ./scripts/config --enable CONFIG_KSU_SUSFS
           ./scripts/config --enable CONFIG_KSU_SUSFS_SUS_PATH
           ./scripts/config --enable CONFIG_KSU_SUSFS_SUS_MOUNT
@@ -112,9 +118,6 @@ jobs:
           ./scripts/config --enable CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
           ./scripts/config --enable CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
           ./scripts/config --enable CONFIG_KSU_SUSFS_OPEN_REDIRECT
-
-          # Disable SUS_SU when using kprobe-based KernelSU-Next hooks to avoid hook conflicts
-          # Reference: https://github.com/devnoname120/susfs4ksu-toco/
           ./scripts/config --disable CONFIG_KSU_SUSFS_SUS_SU
 
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
@@ -125,7 +128,7 @@ jobs:
           export PATH="$HOME/toolchains/clang/bin:$PATH"
           export KBUILD_BUILD_USER="${{ github.event.inputs.build_user }}"
           export KBUILD_BUILD_HOST="${{ github.event.inputs.build_host }}"
-          make -j"$(nproc --all)" ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- Image
+          make -j"$(nproc --all)" ARCH=arm64 LLVM=1 LLVM_IAS=1 Image
 
       - name: Package AnyKernel3 Zip
         # Reference: https://github.com/osm0sis/AnyKernel3
@@ -149,7 +152,7 @@ jobs:
             ### Custom GKI Kernel Build with SUSFS
             * **Kernel Version:** `5.10.272${{ github.event.inputs.localversion }}`
             * **Build Signature:** `${{ github.event.inputs.build_user }}@${{ github.event.inputs.build_host }}`
-            * **Root & Hiding:** KernelSU-Next (`next-susfs`) + SUSFS (`gki-android12-5.10`)
+            * **Root & Hiding:** KernelSU-Next (`dev-susfs`) + SUSFS (`gki-android12-5.10`)
             * **Target Architecture:** ARM64 Android 12 GKI (`android12-5.10-lts`)
           files: |
             Hiruko-puppetmaster-5.10.272-SUSFS.zip
