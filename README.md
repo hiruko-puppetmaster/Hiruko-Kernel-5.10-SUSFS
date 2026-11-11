@@ -2,7 +2,7 @@
 
 # Hiruko-Kernel-5.10-SUSFS
 
-<img src="36970.jpg" alt="Hiruko Banner" width="100%" style="border-radius: 6px;" />
+<img src="https://github.com/hiruko-puppetmaster/Hiruko-Kernel-5.10-SUSFS/blob/main/assets/e2da302e23220dd4807b8aa9a01de905.jpg" alt="Hiruko Banner" width="100%" style="border-radius: 6px;" />
 
 > *"True art is an undying thing..."*
 
