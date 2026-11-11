@@ -22,6 +22,14 @@ permissions:
 jobs:
   build-kernel:
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      KERNEL_REPO_URL: https://android.googlesource.com/kernel/common
+      KERNEL_REF: android12-5.10-lts
+      CLANG_DIR: ${{ github.workspace }}/toolchains/clang
+      BUILD_ROOT: ${{ github.workspace }}
+
     steps:
       - name: Maximize Build Disk Space
         run: |
@@ -29,86 +37,173 @@ jobs:
           df -h
 
       - name: Install Build Dependencies
-        # Reference: https://github.com/thaomaitam/Build-Kernel-GKI2.0-Susfs
         run: |
           sudo apt-get update
           sudo apt-get install -y bc binutils-aarch64-linux-gnu bison build-essential \
             ccache cpio curl dwarves flex gcc-aarch64-linux-gnu git libssl-dev \
             libelf-dev libncurses-dev lz4 python3 python3-pip rsync unzip wget zip
 
+      - name: Cache Clang Toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLANG_DIR }}
+          key: clang-r416183b-${{ runner.os }}-arm64
+
       - name: Download AOSP Clang Toolchain (clang-r416183b)
-        # clang-r416183b lives on the master-kernel-build-2021 branch of AOSP prebuilts:
-        # https://github.com/carlodandan/Action-Kernel-Builder/blob/main/build
-        # https://github.com/mohdakil2426/marble-kernel-builder/blob/main/docs/versions.md
+        if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "$HOME/toolchains/clang"
+          mkdir -p "$CLANG_DIR"
           if wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz" -O clang.tar.gz; then
-            tar -xzf clang.tar.gz -C "$HOME/toolchains/clang"
+            tar -xzf clang.tar.gz -C "$CLANG_DIR"
             rm -f clang.tar.gz
           else
             git clone --depth=1 --filter=blob:none --sparse -b master-kernel-build-2021 \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-repo
             cd clang-repo
             git sparse-checkout set clang-r416183b
-            cp -r clang-r416183b/* "$HOME/toolchains/clang/"
+            cp -r clang-r416183b/* "$CLANG_DIR/"
             cd ..
             rm -rf clang-repo
           fi
-          "$HOME/toolchains/clang/bin/clang" --version
+          "$CLANG_DIR/bin/clang" --version
+
+      - name: Cache Kernel Source
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel
+          key: kernel-${{ env.KERNEL_REF }}-${{ runner.os }}-arm64
 
       - name: Clone Android12-5.10-LTS Kernel Source
-        # Reference: https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10-lts
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        shell: bash
         run: |
-          git clone --depth=1 -b android12-5.10-lts https://android.googlesource.com/kernel/common kernel
+          set -euo pipefail
+          git clone --depth=1 -b "$KERNEL_REF" "$KERNEL_REPO_URL" kernel
           cd kernel
-          head -n 4 Makefile
+          echo "=== Kernel Makefile check ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)\s*:' Makefile
+          grep -nE '^(VERSION|PATCHLEVEL|SUBLEVEL)\s*:' Makefile
+          test -f arch/arm64/Makefile
 
-      - name: Integrate KernelSU-Next (SUSFS) & SUSFS Patches
-        # Verified CI-tested commits for android12-5.10 (5.10.272):
-        # https://github.com/WildKernels/GKI_KernelSU_SUSFS/releases
-        # Avoids fs/statfs.c implicit declaration bug in unpinned HEAD:
-        # https://gitlab.com/simonpunk/susfs4ksu/-/work_items
+      - name: Integrate KernelSU-Next + SUSFS patches
+        shell: bash
         run: |
-          # 1. Setup KernelSU-Next (pershoot/KernelSU-Next#dev-susfs) inside kernel/
+          set -euo pipefail
+
           cd kernel
+
+          echo "=== Install KernelSU-Next ==="
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
           cd ..
 
-          # 2. Clone SUSFS for GKI Android12-5.10
-          git clone -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          echo "=== Resolve SUSFS branch to exact commit SHA ==="
+          SUSFS_BRANCH="gki-android12-5.10"
+          git clone --no-checkout https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          git -C susfs4ksu fetch --depth=1 origin "$SUSFS_BRANCH"
+          SUSFS_SHA="$(git -C susfs4ksu rev-parse FETCH_HEAD)"
+          echo "Using SUSFS commit: $SUSFS_SHA"
+          git -C susfs4ksu checkout --detach "$SUSFS_SHA"
 
-          # 3. Copy SUSFS kernel source files and kernel-side patch into kernel tree
+          echo "=== Copy SUSFS files ==="
           cp susfs4ksu/kernel_patches/fs/* kernel/fs/
           cp susfs4ksu/kernel_patches/include/linux/* kernel/include/linux/
           cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch kernel/
 
-          # 4. Apply kernel-side SUSFS patch (allow fuzz=3 for LTS line-offset shifts)
+          echo "=== Apply SUSFS patch ==="
           cd kernel
-          patch -p1 --forward --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+          patch -p1 --forward --batch --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
 
-          # 5. Guard against simonpunk/susfs4ksu#58 implicit declaration in fs/statfs.c
-          if grep -q "susfs_sus_kstat_spoof_vfs_statfs" fs/statfs.c && ! grep -q "susfs_sus_kstat_spoof_vfs_statfs" include/linux/susfs.h; then
-            sed -i '/susfs_sus_kstat_spoof_vfs_statfs/d' fs/statfs.c
-          fi
+          echo "=== Strict compatibility validation ==="
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("fs/statfs.c")
+          if not path.exists():
+              raise SystemExit(f"{path}: missing after SUSFS patch!")
+
+          source = path.read_text(encoding="utf-8")
+
+          if not re.search(r"\bint\s+vfs_statfs\s*\([^)]*\)\s*\{", source):
+              raise SystemExit(f"{path}: missing vfs_statfs() implementation after patch")
+
+          if not re.search(
+              r"dentry\s*->\s*d_sb\s*->\s*s_op\s*->\s*statfs\s*\(\s*dentry\s*,\s*buf\s*\)",
+              source,
+          ):
+              raise SystemExit(
+                  f"{path}: missing expected statfs call pattern: dentry->d_sb->s_op->statfs(dentry, buf)"
+              )
+
+          code = re.sub(
+              r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+              lambda m: re.sub(r'[^\n]', ' ', m.group(0)),
+              source,
+              flags=re.DOTALL,
+          )
+
+          depth = 0
+          for lineno, line in enumerate(code.splitlines(), start=1):
+              for ch in line:
+                  if ch == '{':
+                      depth += 1
+                  elif ch == '}':
+                      depth -= 1
+                      if depth < 0:
+                          raise SystemExit(f"{path}:{lineno}: unexpected closing brace")
+
+          if depth != 0:
+              raise SystemExit(f"{path}: unbalanced braces (final depth {depth})")
+
+          func_match = re.search(r"\bint\s+vfs_statfs\s*\([^)]*\)\s*\{", code)
+          if not func_match:
+              raise SystemExit(f"{path}: could not locate vfs_statfs() function block")
+
+          open_brace = code.find("{", func_match.start(), func_match.end())
+          func_depth = 1
+          close_idx = None
+          for idx in range(open_brace + 1, len(code)):
+              if code[idx] == "{":
+                  func_depth += 1
+              elif code[idx] == "}":
+                  func_depth -= 1
+                  if func_depth == 0:
+                      close_idx = idx
+                      break
+
+          if close_idx is None:
+              raise SystemExit(f"{path}: vfs_statfs() block has no matching closing brace")
+
+          call_pattern = re.compile(
+              r"dentry\s*->\s*d_sb\s*->\s*s_op\s*->\s*statfs\s*\(\s*dentry\s*,\s*buf\s*\)"
+          )
+          for match in call_pattern.finditer(code):
+              if not (func_match.start() < match.start() < close_idx):
+                  raise SystemExit(f"{path}: statfs call is outside the vfs_statfs() function body")
+
+          print(f"{path}: strict compatibility validation passed")
+          PY
+
+          echo "=== Patch validation complete ==="
 
       - name: Configure Kernel, Localversion & SUSFS
         working-directory: kernel
         run: |
-          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          set -euxo pipefail
+          export PATH="$CLANG_DIR/bin:$PATH"
+
+          echo "=== Configuring kernel ==="
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
 
-          # Custom localversion (-Hiruko-puppetmaster)
           ./scripts/config --set-str CONFIG_LOCALVERSION "${{ github.event.inputs.localversion }}"
           ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
 
-          # Preserve GKI KMI symbol exports and disable noisy UAPI header test/install
-          # Reference: https://github.com/xerootg/linux-duoqin-f25pro
           ./scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS
           ./scripts/config --disable CONFIG_UAPI_HEADER_TEST
           ./scripts/config --disable CONFIG_WERROR
 
-          # Enable KernelSU-Next & SUSFS (manual hooks are provided by 50_add_susfs patch)
-          # Reference: https://github.com/KernelSU-Next/KernelSU-Next/issues/1293
           ./scripts/config --enable CONFIG_KSU
           ./scripts/config --disable CONFIG_KSU_KPROBES_HOOK
           ./scripts/config --enable CONFIG_KSU_SUSFS
@@ -130,13 +225,13 @@ jobs:
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Compile Kernel Image
-        # Reference: https://github.com/SeeFlowerX/BTFHubForAndroid
         working-directory: kernel
         run: |
-          set -o pipefail
-          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          set -euxo pipefail
+          export PATH="$CLANG_DIR/bin:$PATH"
           export KBUILD_BUILD_USER="${{ github.event.inputs.build_user }}"
           export KBUILD_BUILD_HOST="${{ github.event.inputs.build_host }}"
+
           if ! make -j"$(nproc --all)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             HOSTCC=gcc HOSTCXX=g++ KCFLAGS="-Wno-error" Image 2>&1 | tee build.log; then
@@ -146,7 +241,6 @@ jobs:
           fi
 
       - name: Package AnyKernel3 Zip
-        # Reference: https://github.com/osm0sis/AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cp kernel/arch/arm64/boot/Image AnyKernel3/
@@ -158,7 +252,6 @@ jobs:
           zip -r9 ../Hiruko-puppetmaster-5.10.272-SUSFS.zip ./*
 
       - name: Publish to GitHub Releases
-        # Reference: https://github.com/softprops/action-gh-release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v5.10.272-susfs-${{ github.run_number }}
@@ -172,4 +265,3 @@ jobs:
           files: |
             Hiruko-puppetmaster-5.10.272-SUSFS.zip
             kernel/arch/arm64/boot/Image
-            
