@@ -53,6 +53,7 @@ jobs:
       - name: Download AOSP Clang Toolchain (clang-r416183b)
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
+          set -euxo pipefail
           mkdir -p "$CLANG_DIR"
           if wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz" -O clang.tar.gz; then
             tar -xzf clang.tar.gz -C "$CLANG_DIR"
@@ -75,17 +76,124 @@ jobs:
           path: ${{ github.workspace }}/kernel
           key: kernel-${{ env.KERNEL_REF }}-${{ runner.os }}-arm64
 
-      - name: Clone Android12-5.10-LTS Kernel Source
-        if: steps.cache-kernel.outputs.cache-hit != 'true'
+      - name: Prepare and Validate Android12-5.10-LTS Kernel Source
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 -b "$KERNEL_REF" "$KERNEL_REPO_URL" kernel
+
+          valid_kernel_tree() {
+            [[ -f kernel/Makefile ]] &&
+            [[ -f kernel/arch/arm64/Makefile ]] &&
+            grep -qE '^VERSION[[:space:]]*=[[:space:]]*5([[:space:]]|$)' kernel/Makefile &&
+            grep -qE '^PATCHLEVEL[[:space:]]*=[[:space:]]*10([[:space:]]|$)' kernel/Makefile
+          }
+
+          retry_clone() {
+            local attempt
+            for attempt in 1 2 3; do
+              rm -rf kernel
+              echo "Clone attempt $attempt of 3: $KERNEL_REPO_URL ($KERNEL_REF)"
+              if git clone --depth=1 --single-branch --branch "$KERNEL_REF" \
+                "$KERNEL_REPO_URL" kernel; then
+                return 0
+              fi
+              echo "Clone attempt $attempt failed; retrying in $((attempt * 5)) seconds."
+              rm -rf kernel
+              sleep $((attempt * 5))
+            done
+
+            echo "ERROR: Failed to clone the kernel source after 3 attempts."
+            return 1
+          }
+
+          retry_fetch() {
+            local attempt
+            for attempt in 1 2 3; do
+              echo "Fetch attempt $attempt of 3: $KERNEL_REF"
+              if git -C kernel fetch --depth=1 origin "$KERNEL_REF"; then
+                git -C kernel checkout -B "$KERNEL_REF" FETCH_HEAD
+                git -C kernel reset --hard FETCH_HEAD
+                git -C kernel clean -fdx
+                return 0
+              fi
+              echo "Fetch attempt $attempt failed; retrying in $((attempt * 5)) seconds."
+              sleep $((attempt * 5))
+            done
+
+            return 1
+          }
+
+          if git -C kernel rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "Kernel cache checkout found."
+
+            remote_url="$(git -C kernel remote get-url origin || true)"
+            if [[ "$remote_url" == "$KERNEL_REPO_URL" || "$remote_url" == "${KERNEL_REPO_URL}.git" ]]; then
+              echo "Refreshing cached checkout from $KERNEL_REF."
+              git -C kernel reset --hard
+              git -C kernel clean -fdx
+
+              if ! retry_fetch; then
+                echo "Could not refresh cached checkout; replacing it with a fresh clone."
+                retry_clone
+              fi
+            else
+              echo "Cached checkout has an unexpected origin: ${remote_url:-<missing>}"
+              echo "Replacing it with a fresh clone."
+              retry_clone
+            fi
+          else
+            echo "No usable cached Git checkout found; cloning fresh."
+            retry_clone
+          fi
+
+          if ! valid_kernel_tree; then
+            echo "Kernel tree failed validation; replacing it with a fresh clone."
+            retry_clone
+          fi
+
+          if ! valid_kernel_tree; then
+            echo "ERROR: Fresh kernel checkout failed validation."
+            exit 1
+          fi
+
           cd kernel
-          echo "=== Kernel Makefile check ==="
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)\s*:' Makefile
-          grep -nE '^(VERSION|PATCHLEVEL|SUBLEVEL)\s*:' Makefile
+
+          echo "=== Repository ==="
+          git remote -v
+          actual_remote="$(git remote get-url origin)"
+          if [[ "$actual_remote" != "$KERNEL_REPO_URL" && "$actual_remote" != "${KERNEL_REPO_URL}.git" ]]; then
+            echo "ERROR: Unexpected kernel repository URL: $actual_remote"
+            exit 1
+          fi
+
+          echo "=== Branch and commit ==="
+          actual_branch="$(git branch --show-current)"
+          echo "Expected branch: $KERNEL_REF"
+          echo "Checked-out branch: $actual_branch"
+          echo "Commit: $(git rev-parse HEAD)"
+
+          if [[ "$actual_branch" != "$KERNEL_REF" ]]; then
+            echo "ERROR: Checked-out branch does not match KERNEL_REF."
+            exit 1
+          fi
+
+          echo "=== Kernel Makefile version ==="
+          grep -nE '^(VERSION|PATCHLEVEL|SUBLEVEL)[[:space:]]*=' Makefile
+          grep -qE '^VERSION[[:space:]]*=[[:space:]]*5([[:space:]]|$)' Makefile
+          grep -qE '^PATCHLEVEL[[:space:]]*=[[:space:]]*10([[:space:]]|$)' Makefile
+
+          echo "=== Required ARM64 source files ==="
           test -f arch/arm64/Makefile
+          test -f arch/arm64/boot/Makefile
+          ls -l arch/arm64/Makefile arch/arm64/boot/Makefile
+
+          echo "=== AOSP source layout (top two levels) ==="
+          find . -maxdepth 2 -type d -not -path './.git*' | sort | sed -n '1,100p'
+
+          echo "=== ARM64 source layout ==="
+          find arch/arm64 -maxdepth 2 -type f | sort | sed -n '1,100p'
+
+          echo "Kernel branch, version, and source-layout validation passed."
 
       - name: Integrate KernelSU-Next + SUSFS patches
         shell: bash
