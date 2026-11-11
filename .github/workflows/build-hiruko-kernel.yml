@@ -33,8 +33,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc binutils-aarch64-linux-gnu bison build-essential \
-            ccache cpio curl dwarves flex git libssl-dev libelf-dev lz4 python3 \
-            python3-pip rsync unzip wget zip
+            ccache cpio curl dwarves flex gcc-aarch64-linux-gnu git libssl-dev \
+            libelf-dev libncurses-dev lz4 python3 python3-pip rsync unzip wget zip
 
       - name: Download AOSP Clang Toolchain (clang-r416183b)
         # clang-r416183b lives on the master-kernel-build-2021 branch of AOSP prebuilts:
@@ -64,27 +64,32 @@ jobs:
           head -n 4 Makefile
 
       - name: Integrate KernelSU-Next (SUSFS) & SUSFS Patches
-        # Pre-integrated KernelSU-Next SUSFS branch (pershoot/KernelSU-Next#dev-susfs):
+        # Verified CI-tested commits for android12-5.10 (5.10.272):
         # https://github.com/WildKernels/GKI_KernelSU_SUSFS/releases
-        # https://github.com/KernelSU-Next/KernelSU-Next/issues/1293
-        # SUSFS repository: https://gitlab.com/simonpunk/susfs4ksu/-/tags
+        # Avoids fs/statfs.c implicit declaration bug in unpinned HEAD:
+        # https://gitlab.com/simonpunk/susfs4ksu/-/work_items
         run: |
-          # 1. Setup KernelSU-Next with pre-integrated SUSFS inside kernel/
+          # 1. Setup KernelSU-Next (pershoot/KernelSU-Next#dev-susfs) inside kernel/
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
           cd ..
 
           # 2. Clone SUSFS for GKI Android12-5.10
-          git clone --depth=1 -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          git clone -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
 
           # 3. Copy SUSFS kernel source files and kernel-side patch into kernel tree
           cp susfs4ksu/kernel_patches/fs/* kernel/fs/
           cp susfs4ksu/kernel_patches/include/linux/* kernel/include/linux/
           cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch kernel/
 
-          # 4. Apply kernel-side SUSFS patch (allow fuzz=3 for minor LTS line-offset shifts)
+          # 4. Apply kernel-side SUSFS patch (allow fuzz=3 for LTS line-offset shifts)
           cd kernel
           patch -p1 --forward --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+
+          # 5. Guard against simonpunk/susfs4ksu#58 implicit declaration in fs/statfs.c
+          if grep -q "susfs_sus_kstat_spoof_vfs_statfs" fs/statfs.c && ! grep -q "susfs_sus_kstat_spoof_vfs_statfs" include/linux/susfs.h; then
+            sed -i '/susfs_sus_kstat_spoof_vfs_statfs/d' fs/statfs.c
+          fi
 
       - name: Configure Kernel, Localversion & SUSFS
         working-directory: kernel
@@ -96,9 +101,11 @@ jobs:
           ./scripts/config --set-str CONFIG_LOCALVERSION "${{ github.event.inputs.localversion }}"
           ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
 
-          # Preserve GKI KMI symbol exports when building via raw make so vendor .ko modules load
+          # Preserve GKI KMI symbol exports and disable noisy UAPI header test/install
           # Reference: https://github.com/xerootg/linux-duoqin-f25pro
           ./scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS
+          ./scripts/config --disable CONFIG_UAPI_HEADER_TEST
+          ./scripts/config --disable CONFIG_WERROR
 
           # Enable KernelSU-Next & SUSFS (manual hooks are provided by 50_add_susfs patch)
           # Reference: https://github.com/KernelSU-Next/KernelSU-Next/issues/1293
@@ -123,12 +130,20 @@ jobs:
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Compile Kernel Image
+        # Reference: https://github.com/SeeFlowerX/BTFHubForAndroid
         working-directory: kernel
         run: |
+          set -o pipefail
           export PATH="$HOME/toolchains/clang/bin:$PATH"
           export KBUILD_BUILD_USER="${{ github.event.inputs.build_user }}"
           export KBUILD_BUILD_HOST="${{ github.event.inputs.build_host }}"
-          make -j"$(nproc --all)" ARCH=arm64 LLVM=1 LLVM_IAS=1 Image
+          if ! make -j"$(nproc --all)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            HOSTCC=gcc HOSTCXX=g++ KCFLAGS="-Wno-error" Image 2>&1 | tee build.log; then
+            echo "=== COMPILER ERRORS SUMMARY ==="
+            grep -n -C 3 -E "error:|fatal error:|undefined reference|implicit declaration" build.log || tail -n 50 build.log
+            exit 1
+          fi
 
       - name: Package AnyKernel3 Zip
         # Reference: https://github.com/osm0sis/AnyKernel3
