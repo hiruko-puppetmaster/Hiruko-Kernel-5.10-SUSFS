@@ -229,70 +229,165 @@ jobs:
           from pathlib import Path
 
           path = Path("fs/statfs.c")
-          if not path.exists():
-              raise SystemExit(f"{path}: missing after SUSFS patch!")
+          if not path.is_file():
+              raise SystemExit(f"{path}: missing after SUSFS patch")
 
           source = path.read_text(encoding="utf-8")
 
-          if not re.search(r"\bint\s+vfs_statfs\s*\([^)]*\)\s*\{", source):
-              raise SystemExit(f"{path}: missing vfs_statfs() implementation after patch")
+          def mask_comments_and_literals(text):
+              """Mask comments and literals while preserving offsets and newlines."""
+              out = list(text)
+              i = 0
+              state = "code"
 
-          if not re.search(
-              r"dentry\s*->\s*d_sb\s*->\s*s_op\s*->\s*statfs\s*\(\s*dentry\s*,\s*buf\s*\)",
-              source,
-          ):
-              raise SystemExit(
-                  f"{path}: missing expected statfs call pattern: dentry->d_sb->s_op->statfs(dentry, buf)"
+              while i < len(text):
+                  ch = text[i]
+                  nxt = text[i + 1] if i + 1 < len(text) else ""
+
+                  if state == "code":
+                      if ch == "/" and nxt == "/":
+                          out[i] = out[i + 1] = " "
+                          i += 2
+                          state = "line_comment"
+                          continue
+                      if ch == "/" and nxt == "*":
+                          out[i] = out[i + 1] = " "
+                          i += 2
+                          state = "block_comment"
+                          continue
+                      if ch == '"':
+                          out[i] = " "
+                          state = "string"
+                      elif ch == "'":
+                          out[i] = " "
+                          state = "char"
+                  elif state == "line_comment":
+                      if ch == "\n":
+                          state = "code"
+                      else:
+                          out[i] = " "
+                  elif state == "block_comment":
+                      if ch == "*" and nxt == "/":
+                          out[i] = out[i + 1] = " "
+                          i += 2
+                          state = "code"
+                          continue
+                      if ch != "\n":
+                          out[i] = " "
+                  elif state in ("string", "char"):
+                      quote = '"' if state == "string" else "'"
+                      if ch == "\\":
+                          if ch != "\n":
+                              out[i] = " "
+                          if i + 1 < len(text):
+                              if text[i + 1] != "\n":
+                                  out[i + 1] = " "
+                              i += 2
+                              continue
+                      elif ch == quote:
+                          out[i] = " "
+                          state = "code"
+                      elif ch != "\n":
+                          out[i] = " "
+
+                  i += 1
+
+              if state == "block_comment":
+                  raise SystemExit(f"{path}: unterminated block comment")
+              if state in ("string", "char"):
+                  raise SystemExit(f"{path}: unterminated string or character literal")
+
+              return "".join(out)
+
+          code = mask_comments_and_literals(source)
+
+          # Check balanced parentheses, brackets, and braces in the source.
+          pairs = {")": "(", "]": "[", "}": "{"}
+          stack = []
+          line = 1
+
+          for ch in code:
+              if ch == "\n":
+                  line += 1
+              elif ch in "([{":
+                  stack.append((ch, line))
+              elif ch in ")]}":
+                  if not stack or stack[-1][0] != pairs[ch]:
+                      raise SystemExit(f"{path}:{line}: unexpected closing {ch}")
+                  stack.pop()
+
+          if stack:
+              ch, opening_line = stack[-1]
+              raise SystemExit(f"{path}:{opening_line}: unclosed delimiter {ch}")
+
+          def function_body(name):
+              """Return the signature start and body bounds for an int function."""
+              signature = re.compile(
+                  rf"\b(?:static\s+)?int\s+{re.escape(name)}"
+                  rf"\s*\([^;{{}}]*\)\s*\{{",
+                  re.MULTILINE,
               )
+              match = signature.search(code)
+              if not match:
+                  raise SystemExit(f"{path}: missing {name}() definition")
 
-          code = re.sub(
-              r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
-              lambda m: re.sub(r'[^\n]', ' ', m.group(0)),
-              source,
-              flags=re.DOTALL,
-          )
+              open_brace = code.find("{", match.start(), match.end())
+              depth = 1
 
-          depth = 0
-          for lineno, line in enumerate(code.splitlines(), start=1):
-              for ch in line:
-                  if ch == '{':
+              for index in range(open_brace + 1, len(code)):
+                  if code[index] == "{":
                       depth += 1
-                  elif ch == '}':
+                  elif code[index] == "}":
                       depth -= 1
-                      if depth < 0:
-                          raise SystemExit(f"{path}:{lineno}: unexpected closing brace")
+                      if depth == 0:
+                          return match.start(), open_brace, index
 
-          if depth != 0:
-              raise SystemExit(f"{path}: unbalanced braces (final depth {depth})")
+              raise SystemExit(f"{path}: {name}() has no matching closing brace")
 
-          func_match = re.search(r"\bint\s+vfs_statfs\s*\([^)]*\)\s*\{", code)
-          if not func_match:
-              raise SystemExit(f"{path}: could not locate vfs_statfs() function block")
-
-          open_brace = code.find("{", func_match.start(), func_match.end())
-          func_depth = 1
-          close_idx = None
-          for idx in range(open_brace + 1, len(code)):
-              if code[idx] == "{":
-                  func_depth += 1
-              elif code[idx] == "}":
-                  func_depth -= 1
-                  if func_depth == 0:
-                      close_idx = idx
-                      break
-
-          if close_idx is None:
-              raise SystemExit(f"{path}: vfs_statfs() block has no matching closing brace")
+          # SUSFS places the real filesystem statfs call in this helper,
+          # not necessarily directly in vfs_statfs().
+          _, helper_open, helper_close = function_body("susfs_statfs_by_dentry")
+          helper_body = code[helper_open + 1:helper_close]
 
           call_pattern = re.compile(
-              r"dentry\s*->\s*d_sb\s*->\s*s_op\s*->\s*statfs\s*\(\s*dentry\s*,\s*buf\s*\)"
+              r"dentry\s*->\s*d_sb\s*->\s*s_op\s*->\s*statfs"
+              r"\s*\(\s*dentry\s*,\s*buf\s*\)"
           )
-          for match in call_pattern.finditer(code):
-              if not (func_match.start() < match.start() < close_idx):
-                  raise SystemExit(f"{path}: statfs call is outside the vfs_statfs() function body")
+          call_match = call_pattern.search(helper_body)
+          if not call_match:
+              raise SystemExit(
+                  f"{path}: susfs_statfs_by_dentry() is missing the expected "
+                  "dentry->d_sb->s_op->statfs(dentry, buf) call"
+              )
 
-          print(f"{path}: strict compatibility validation passed")
+          hook_match = re.search(
+              r"susfs_sus_kstat_spoof_vfs_statfs\s*\(",
+              helper_body,
+          )
+          if not hook_match:
+              raise SystemExit(
+                  f"{path}: SUSFS statfs spoof hook is missing from "
+                  "susfs_statfs_by_dentry()"
+              )
+          if hook_match.start() > call_match.start():
+              raise SystemExit(
+                  f"{path}: SUSFS statfs spoof hook must appear before "
+                  "the filesystem statfs call"
+              )
+
+          # vfs_statfs() should route through the SUSFS helper.
+          _, vfs_open, vfs_close = function_body("vfs_statfs")
+          vfs_body = code[vfs_open + 1:vfs_close]
+          if not re.search(r"\bsusfs_statfs_by_dentry\s*\(", vfs_body):
+              raise SystemExit(
+                  f"{path}: vfs_statfs() does not dispatch to "
+                  "susfs_statfs_by_dentry()"
+              )
+
+          print(f"{path}: SUSFS statfs structure validation passed")
           PY
+
+          echo "=== Patch validation complete ==="
 
           echo "=== Patch validation complete ==="
 
